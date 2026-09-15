@@ -1,6 +1,7 @@
 """Privacy-preserving adaptive model ranking from recent performance telemetry."""
 
 from dataclasses import dataclass
+import math
 import time
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -18,18 +19,24 @@ class AdaptiveRankingConfig:
     cost_weight: float = 0.10
 
     def __post_init__(self) -> None:
-        if self.window_seconds <= 0:
+        if not math.isfinite(self.window_seconds) or self.window_seconds <= 0:
             raise ValueError("window_seconds must be positive")
-        if self.rerank_interval_seconds < 0:
+        if (
+            not math.isfinite(self.rerank_interval_seconds)
+            or self.rerank_interval_seconds < 0
+        ):
             raise ValueError("rerank_interval_seconds cannot be negative")
         if self.minimum_samples <= 0:
             raise ValueError("minimum_samples must be positive")
-        total_weight = (
-            self.quality_weight
-            + self.success_weight
-            + self.latency_weight
-            + self.cost_weight
+        weights = (
+            self.quality_weight,
+            self.success_weight,
+            self.latency_weight,
+            self.cost_weight,
         )
+        if any(not math.isfinite(weight) or weight < 0 for weight in weights):
+            raise ValueError("ranking weights must be finite and non-negative")
+        total_weight = sum(weights)
         if abs(total_weight - 1.0) > 1e-9:
             raise ValueError("ranking weights must sum to 1.0")
 
@@ -86,11 +93,17 @@ class AdaptiveHierarchyRanker:
         """Record a validated performance outcome without request-level data."""
         if not observation.model_id:
             raise ValueError("model_id is required")
-        if not 0.0 <= observation.quality_score <= 1.0:
+        if (
+            not math.isfinite(observation.quality_score)
+            or not 0.0 <= observation.quality_score <= 1.0
+        ):
             raise ValueError("quality_score must be between 0.0 and 1.0")
-        if observation.latency_seconds < 0:
+        if (
+            not math.isfinite(observation.latency_seconds)
+            or observation.latency_seconds < 0
+        ):
             raise ValueError("latency_seconds cannot be negative")
-        if observation.cost < 0:
+        if not math.isfinite(observation.cost) or observation.cost < 0:
             raise ValueError("cost cannot be negative")
 
         recorded_at = observation.recorded_at
@@ -104,6 +117,8 @@ class AdaptiveHierarchyRanker:
                 success=observation.success,
                 recorded_at=recorded_at,
             )
+        elif not math.isfinite(recorded_at):
+            raise ValueError("recorded_at must be finite")
 
         self._observations.setdefault(observation.model_id, []).append(observation)
         self._prune(recorded_at)
@@ -217,16 +232,31 @@ class AdaptiveHierarchyRanker:
             "cost": sum(item.cost for item in observations) / sample_count,
         }
 
-    def _prune(self, now: float) -> None:
+    def prune_expired(self, *, now: Optional[float] = None) -> bool:
+        """Drop expired observations and report whether cached inputs changed."""
+        current_time = time.time() if now is None else now
+        if not math.isfinite(current_time):
+            raise ValueError("now must be finite")
+        return self._prune(current_time)
+
+    def _prune(self, now: float) -> bool:
         cutoff = now - self.config.window_seconds
+        changed = False
         for model_id in list(self._observations):
+            original = self._observations[model_id]
             retained = [
                 observation
-                for observation in self._observations[model_id]
+                for observation in original
                 if observation.recorded_at is not None
                 and observation.recorded_at >= cutoff
             ]
+            changed = changed or len(retained) != len(original)
             if retained:
                 self._observations[model_id] = retained
             else:
                 del self._observations[model_id]
+        if changed:
+            self._cached_ranking = []
+            self._last_model_set = ()
+            self._last_ranked_at = None
+        return changed

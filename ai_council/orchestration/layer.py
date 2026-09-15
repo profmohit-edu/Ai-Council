@@ -735,6 +735,19 @@ class ConcreteOrchestrationLayer(OrchestrationLayer):
         return final_responses
     
 
+    def _record_execution_outcome(
+        self, response: AgentResponse, fallback_model_id: str
+    ) -> None:
+        """Record every model attempt, including failures without an assessment."""
+        assessment = response.self_assessment
+        self.cost_optimizer.update_performance_history(
+            response.model_used or fallback_model_id,
+            assessment.estimated_cost if assessment else 0.0,
+            assessment.confidence_score if assessment else 0.0,
+            actual_latency=assessment.execution_time if assessment else 0.0,
+            success=response.success,
+        )
+
     async def _execute_single_subtask(
         self, 
         subtask: Subtask, 
@@ -742,6 +755,8 @@ class ConcreteOrchestrationLayer(OrchestrationLayer):
         progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None
     ) -> AgentResponse:
         """Execute a single subtask with full error handling."""
+        selected_model = None
+        active_model = None
         try:
             # Get available models
             models = self.model_registry.get_models_for_task_type(subtask.task_type)
@@ -772,6 +787,7 @@ class ConcreteOrchestrationLayer(OrchestrationLayer):
                 (m for m in models if m.get_model_id() == optimization.recommended_model),
                 None
             )
+            active_model = selected_model
             
             # Execute subtask with timeout protection
             response = await timeout_handler.execute_with_timeout(
@@ -785,6 +801,7 @@ class ConcreteOrchestrationLayer(OrchestrationLayer):
                 selected_model,
                 progress_callback=progress_callback
             )
+            self._record_execution_outcome(response, selected_model.get_model_id())
 
             # Semantic Recovery Logic
             if not response.success or (getattr(response, 'self_assessment', None) and response.self_assessment.confidence_score < 0.5):
@@ -799,6 +816,7 @@ class ConcreteOrchestrationLayer(OrchestrationLayer):
                     reverse=True
                 )
                 better_model = better_models[0] if better_models else selected_model
+                active_model = better_model
                 
                 response = await timeout_handler.execute_with_timeout(
                     self.execution_agent.execute,
@@ -811,39 +829,40 @@ class ConcreteOrchestrationLayer(OrchestrationLayer):
                     better_model,
                     progress_callback=progress_callback
                 )
-            
-            # Update cost optimizer with actual performance
-            if response.success and response.self_assessment:
-                self.cost_optimizer.update_performance_history(
-                    response.model_used,
-                    response.self_assessment.estimated_cost,
-                    response.self_assessment.confidence_score,
-                    actual_latency=response.self_assessment.execution_time,
-                    success=response.success,
-                )
+                self._record_execution_outcome(response, better_model.get_model_id())
             
             return response
             
         except TimeoutError as e:
             logger.warning("Subtask timed out", extra={"subtask_id": subtask.id, "error": str(e)})
-            return AgentResponse(
+            response = AgentResponse(
                 subtask_id=subtask.id,
-                model_used="timeout",
+                model_used=(
+                    active_model.get_model_id() if active_model is not None else "timeout"
+                ),
                 content="",
                 success=False,
                 error_message=f"Execution timed out: {str(e)}",
                 metadata={"timeout": True, "timeout_duration": e.timeout_duration}
             )
+            if active_model is not None:
+                self._record_execution_outcome(response, active_model.get_model_id())
+            return response
             
         except Exception as e:
             logger.error("Failed to execute subtask", extra={"subtask_id": subtask.id, "error": str(e)})
-            return AgentResponse(
+            response = AgentResponse(
                 subtask_id=subtask.id,
-                model_used="unknown",
+                model_used=(
+                    active_model.get_model_id() if active_model is not None else "unknown"
+                ),
                 content="",
                 success=False,
                 error_message=str(e)
             )
+            if active_model is not None:
+                self._record_execution_outcome(response, active_model.get_model_id())
+            return response
     
     # =========================================================================
     # PUBLIC METHODS - Required by interface

@@ -1,4 +1,5 @@
 import json
+import math
 
 import pytest
 
@@ -8,6 +9,7 @@ from ai_council.orchestration.adaptive_ranker import (
     PerformanceObservation,
 )
 from ai_council.orchestration.cost_optimizer import CostOptimizer
+from ai_council.core.models import ExecutionMode, Subtask, TaskType
 from scripts.compare_model_performance import load_observations, main
 
 
@@ -58,6 +60,22 @@ def test_window_expiry_removes_stale_observations():
 
     assert aggregates["model-a"]["sample_count"] == 1
     assert aggregates["model-a"]["quality"] == pytest.approx(0.2)
+
+
+def test_window_expiry_invalidates_cached_ranking():
+    ranker = AdaptiveHierarchyRanker(
+        AdaptiveRankingConfig(
+            window_seconds=10, minimum_samples=1, rerank_interval_seconds=100
+        )
+    )
+    ranker.record(observation("a", 1.0, 0.1, 0.0, 100))
+    ranker.record(observation("b", 0.9, 0.1, 0.0, 105))
+    assert ranker.rank(["a", "b"], now=105)[0].model_id == "a"
+
+    ranking = ranker.rank(["a", "b"], now=111)
+
+    assert ranking[0].model_id == "b"
+    assert ranking[0].sample_count == 1
 
 
 def test_ranking_refreshes_only_after_configured_interval():
@@ -139,6 +157,55 @@ def test_cost_optimizer_feeds_execution_outcomes_into_adaptive_hierarchy(tmp_pat
     optimizer._optimization_cache.close()
 
 
+def test_invalid_telemetry_does_not_mutate_legacy_history(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    optimizer = CostOptimizer(model_registry=object())
+
+    with pytest.raises(ValueError):
+        optimizer.update_performance_history(
+            "model-a", actual_cost=0.1, quality_score=math.nan
+        )
+
+    assert "model-a" not in optimizer._performance_history
+    optimizer._optimization_cache.close()
+
+
+def test_expired_adaptive_observation_invalidates_selection_cache(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    ranker = AdaptiveHierarchyRanker(
+        AdaptiveRankingConfig(window_seconds=1, minimum_samples=1)
+    )
+    ranker.record(observation("model-a", 1.0, 0.1, 0.0, 1))
+    optimizer = CostOptimizer(model_registry=object(), adaptive_ranker=ranker)
+    subtask = Subtask(content="test", task_type=TaskType.REASONING)
+    cache_key = optimizer._create_cache_key(
+        subtask, ExecutionMode.BALANCED, ["model-a"]
+    )
+    optimizer._optimization_cache[cache_key] = "stale"
+    monkeypatch.setattr(
+        optimizer,
+        "_score_model_for_optimization",
+        lambda *_: {
+            "composite_score": 0.8,
+            "cost": 0.1,
+            "time": 1.0,
+            "quality": 0.8,
+            "reliability": 0.9,
+            "confidence": 0.8,
+        },
+    )
+
+    result = optimizer.optimize_model_selection(
+        subtask, ExecutionMode.BALANCED, ["model-a"]
+    )
+
+    assert result.recommended_model == "model-a"
+    assert result != "stale"
+    optimizer._optimization_cache.close()
+
+
 def test_smoke_cli_compares_jsonl_benchmarks(tmp_path, capsys):
     benchmark = tmp_path / "benchmark.jsonl"
     rows = [
@@ -204,3 +271,102 @@ def test_smoke_cli_rejects_string_boolean_values(tmp_path):
 
     with pytest.raises(ValueError, match="success must be a JSON boolean"):
         load_observations(benchmark)
+
+
+def test_smoke_cli_rejects_non_object_json(tmp_path):
+    benchmark = tmp_path / "bad-shape.jsonl"
+    benchmark.write_text("[]\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="line 1.*JSON object"):
+        load_observations(benchmark)
+
+
+@pytest.mark.parametrize("window", ["nan", "inf", "-1", "0"])
+def test_smoke_cli_rejects_invalid_window(tmp_path, window):
+    benchmark = tmp_path / "benchmark.jsonl"
+    benchmark.write_text(
+        json.dumps(
+            {
+                "model_id": "a",
+                "quality_score": 0.9,
+                "latency_seconds": 1.0,
+                "cost": 0.1,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="window-hours"):
+        main(
+            [
+                str(benchmark),
+                "--orchestrated-model",
+                "a",
+                "--native-model",
+                "b",
+                "--window-hours",
+                window,
+            ]
+        )
+
+
+def test_smoke_cli_normalizes_missing_timestamp_to_reference_time(tmp_path, capsys):
+    benchmark = tmp_path / "mixed-timestamps.jsonl"
+    rows = [
+        {
+            "model_id": "orchestrated",
+            "quality_score": 0.9,
+            "latency_seconds": 1.0,
+            "cost": 0.01,
+            "recorded_at": 100,
+        },
+        {
+            "model_id": "native",
+            "quality_score": 0.8,
+            "latency_seconds": 2.0,
+            "cost": 0.02,
+        },
+    ]
+    benchmark.write_text("\n".join(map(json.dumps, rows)), encoding="utf-8")
+
+    assert main(
+        [
+            str(benchmark),
+            "--orchestrated-model",
+            "orchestrated",
+            "--native-model",
+            "native",
+            "--minimum-samples",
+            "1",
+        ]
+    ) == 0
+    assert json.loads(capsys.readouterr().out)["comparison"]["native_samples"] == 1
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {"window_seconds": math.nan},
+        {"window_seconds": math.inf},
+        {"rerank_interval_seconds": math.nan},
+        {"quality_weight": math.nan},
+        {"quality_weight": -0.1, "success_weight": 0.4},
+    ],
+)
+def test_non_finite_or_negative_ranking_config_is_rejected(config):
+    with pytest.raises(ValueError):
+        AdaptiveRankingConfig(**config)
+
+
+@pytest.mark.parametrize(
+    "bad_observation",
+    [
+        observation("model", 0.5, math.nan, 0.01, 100),
+        observation("model", 0.5, math.inf, 0.01, 100),
+        observation("model", 0.5, 1.0, math.nan, 100),
+        observation("model", 0.5, 1.0, 0.01, math.nan),
+    ],
+)
+def test_non_finite_telemetry_is_rejected(bad_observation):
+    with pytest.raises(ValueError):
+        AdaptiveHierarchyRanker().record(bad_observation)

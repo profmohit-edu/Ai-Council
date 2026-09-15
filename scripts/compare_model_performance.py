@@ -2,8 +2,9 @@
 """Compare orchestrated model outcomes with a native benchmark JSONL file."""
 
 import argparse
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import json
+import math
 from pathlib import Path
 import sys
 import time
@@ -31,6 +32,8 @@ def load_observations(path: Path) -> List[PerformanceObservation]:
                 continue
             try:
                 item = json.loads(line)
+                if not isinstance(item, dict):
+                    raise TypeError("observation must be a JSON object")
                 success = item.get("success", True)
                 if not isinstance(success, bool):
                     raise TypeError("success must be a JSON boolean")
@@ -71,6 +74,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = build_parser().parse_args(argv)
+    if not math.isfinite(args.window_hours) or args.window_hours <= 0:
+        raise ValueError("window-hours must be finite and positive")
     observations = load_observations(args.benchmark)
     timestamps = [
         observation.recorded_at
@@ -78,7 +83,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         if observation.recorded_at is not None
     ]
     reference_time = max(timestamps) if timestamps else time.time()
-    observations.sort(key=lambda item: item.recorded_at or reference_time)
+    observations = [
+        replace(observation, recorded_at=reference_time)
+        if observation.recorded_at is None
+        else observation
+        for observation in observations
+    ]
+    observations.sort(key=lambda item: item.recorded_at)
 
     ranker = AdaptiveHierarchyRanker(
         AdaptiveRankingConfig(

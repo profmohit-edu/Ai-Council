@@ -48,6 +48,11 @@ Companies can seed the hierarchy with representative benchmark outcomes:
 ```python
 from ai_council.orchestration import PerformanceObservation
 
+# Keep this compact example actionable with one observation per model.
+ranker = AdaptiveHierarchyRanker(
+    AdaptiveRankingConfig(minimum_samples=1)
+)
+
 ranker.pretrain(
     [
         PerformanceObservation(

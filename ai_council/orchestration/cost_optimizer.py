@@ -96,6 +96,10 @@ class CostOptimizer:
         """
         # Create cache key
         cache_key = self._create_cache_key(subtask, execution_mode, available_models)
+
+        # A selection derived from adaptive observations must not outlive them.
+        if self.adaptive_ranker.prune_expired():
+            self.clear_cache()
         
         # Check cache first
         if cache_key in self._optimization_cache:
@@ -268,12 +272,6 @@ class CostOptimizer:
             actual_cost: Actual cost incurred
             quality_score: Achieved quality score
         """
-        efficiency = quality_score / max(actual_cost, 0.001)
-        
-        if model_id not in self._performance_history:
-            self._performance_history[model_id] = []
-        
-        self._performance_history[model_id].append(efficiency)
         self.adaptive_ranker.record(
             PerformanceObservation(
                 model_id=model_id,
@@ -283,6 +281,11 @@ class CostOptimizer:
                 success=success,
             )
         )
+
+        efficiency = quality_score / max(actual_cost, 0.001)
+        if model_id not in self._performance_history:
+            self._performance_history[model_id] = []
+        self._performance_history[model_id].append(efficiency)
         
         # Keep only recent history (last 100 entries)
         if len(self._performance_history[model_id]) > 100:
