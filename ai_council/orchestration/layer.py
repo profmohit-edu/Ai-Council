@@ -817,7 +817,9 @@ class ConcreteOrchestrationLayer(OrchestrationLayer):
                 self.cost_optimizer.update_performance_history(
                     response.model_used,
                     response.self_assessment.estimated_cost,
-                    response.self_assessment.confidence_score
+                    response.self_assessment.confidence_score,
+                    actual_latency=response.self_assessment.execution_time,
+                    success=response.success,
                 )
             
             return response

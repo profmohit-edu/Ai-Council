@@ -14,6 +14,7 @@ from ..core.models import (
     ModelCapabilities, CostProfile, PerformanceMetrics
 )
 from ..core.logger import get_logger
+from .adaptive_ranker import AdaptiveHierarchyRanker, PerformanceObservation
 
 
 logger = get_logger(__name__)
@@ -50,7 +51,11 @@ class CostOptimizer:
     - Dynamic pricing and quality optimization
     """
     
-    def __init__(self, model_registry: ModelRegistry):
+    def __init__(
+        self,
+        model_registry: ModelRegistry,
+        adaptive_ranker: Optional[AdaptiveHierarchyRanker] = None,
+    ):
         """
         Initialize the cost optimizer.
         
@@ -65,6 +70,7 @@ class CostOptimizer:
         self.cache_ttl = 86400  # 24 hours TTL in seconds
         
         self._performance_history: Dict[str, List[float]] = {}
+        self.adaptive_ranker = adaptive_ranker or AdaptiveHierarchyRanker()
         
         # Optimization weights for different execution modes
         self._mode_weights = self._build_mode_weights()
@@ -246,7 +252,14 @@ class CostOptimizer:
         
         return tradeoff_analysis
     
-    def update_performance_history(self, model_id: str, actual_cost: float, quality_score: float):
+    def update_performance_history(
+        self,
+        model_id: str,
+        actual_cost: float,
+        quality_score: float,
+        actual_latency: float = 0.0,
+        success: bool = True,
+    ):
         """
         Update performance history for model cost optimization.
         
@@ -261,12 +274,33 @@ class CostOptimizer:
             self._performance_history[model_id] = []
         
         self._performance_history[model_id].append(efficiency)
+        self.adaptive_ranker.record(
+            PerformanceObservation(
+                model_id=model_id,
+                quality_score=quality_score,
+                latency_seconds=actual_latency,
+                cost=actual_cost,
+                success=success,
+            )
+        )
         
         # Keep only recent history (last 100 entries)
         if len(self._performance_history[model_id]) > 100:
             self._performance_history[model_id] = self._performance_history[model_id][-100:]
+
+        # New observations must invalidate selections made from older telemetry.
+        self.clear_cache()
         
         logger.debug("Updated performance history", extra={"model_id": model_id, "efficiency": efficiency})
+
+    def get_adaptive_hierarchy(
+        self, available_models: List[str], force: bool = False
+    ) -> List[str]:
+        """Return model IDs ordered by recent anonymous performance outcomes."""
+        return [
+            ranked.model_id
+            for ranked in self.adaptive_ranker.rank(available_models, force=force)
+        ]
     
     def _get_optimization_strategy(self, execution_mode: ExecutionMode) -> OptimizationStrategy:
         """Get optimization strategy based on execution mode."""
@@ -322,6 +356,12 @@ class CostOptimizer:
             history = self._performance_history[model_id]
             avg_efficiency = sum(history) / len(history)
             composite_score *= (1.0 + min(avg_efficiency * 0.1, 0.2))  # Up to 20% bonus
+
+        adaptive_score = self.adaptive_ranker.score(model_id)
+        if adaptive_score is not None:
+            # Recent measured outcomes influence selection without overwhelming the
+            # task-specific capability and execution-mode signals above.
+            composite_score = composite_score * 0.8 + adaptive_score * 0.2
         
         return {
             'composite_score': composite_score,

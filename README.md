@@ -304,6 +304,7 @@ print(f"Circuit Breakers: {status.circuit_breakers}")
 | Document | Description |
 |----------|-------------|
 | **[🎯 Orchestrator Guide](./docs/ORCHESTRATOR_GUIDE.md)** | Advanced orchestration patterns |
+| **[📈 Adaptive Hierarchy](./docs/ADAPTIVE_HIERARCHY.md)** | Rolling performance ranking, pre-training, and native smoke tests |
 | **[⚡ Quick Reference](./docs/QUICK_REFERENCE.md)** | Common tasks and snippets |
 | **[📊 Business Case](./docs/business/BUSINESS_CASE.md)** | ROI and business value |
 | **[📦 Publishing Guide](./docs/PUBLISHING_GUIDE.md)** | How to publish to PyPI 
